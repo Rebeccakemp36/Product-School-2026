@@ -1,4 +1,4 @@
 # Cortex starter, the transparent agent your coding agent builds with you.
 # Pinned to compatible ranges; bump deliberately.
-openai>=1.51        # the model client in agent.py / critic.py
-python-dotenv>=1.0  # loads .env so OPENAI_API_KEY etc. are picked up
+claude-agent-sdk>=0.2   # the model client (llm.py), uses your Claude login, no API key
+python-dotenv>=1.0      # loads .env so the CORTEX_* bounds are picked up

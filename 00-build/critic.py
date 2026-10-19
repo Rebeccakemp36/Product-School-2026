@@ -7,25 +7,23 @@ from __future__ import annotations
 
 import json
 
+import llm
 from prompts import CRITIC_SYSTEM
 
 
-def review(client, model: str, proposed_output: str, source_data: str) -> dict:
+def review(model: str, proposed_output: str, source_data: str) -> dict:
     """Return {"verdict": "pass"|"fail", "reasons": [...]} for a proposed output."""
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": CRITIC_SYSTEM},
-            {"role": "user", "content":
-                f"SOURCE DATA Cortex used:\n{source_data}\n\n"
-                f"CORTEX PROPOSED OUTPUT:\n{proposed_output}"},
-        ],
-        response_format={"type": "json_object"},
-    )
-    usage = resp.usage
+    text, cost = llm.complete(
+        CRITIC_SYSTEM + "\nRespond with the JSON object only, no other text.",
+        f"SOURCE DATA Cortex used:\n{source_data}\n\n"
+        f"CORTEX PROPOSED OUTPUT:\n{proposed_output}",
+        model)
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.strip("`").removeprefix("json").strip()
     try:
-        verdict = json.loads(resp.choices[0].message.content)
-    except (json.JSONDecodeError, TypeError):
+        verdict = json.loads(text)
+    except json.JSONDecodeError:
         verdict = {"verdict": "fail", "reasons": ["critic returned unparseable output"]}
-    verdict["_usage"] = {"prompt": usage.prompt_tokens, "completion": usage.completion_tokens}
+    verdict["_cost"] = cost
     return verdict

@@ -16,11 +16,11 @@ Every run ends by showing the drafted status update in a FINAL STATUS UPDATE blo
 (or LAST DRAFT, held, if a bound trips), and saves it to run-output/. That file is
 always a draft held for a human, it is never posted, there is no publish tool.
 
-Requires OPENAI_API_KEY in your environment (see .env.example). Model and bounds
-are read from env so you can tune them, that tuning is your M5 deliverable.
+Talks to Claude through the Claude Agent SDK using your Claude login, so there is no
+API key to set (see llm.py). Model and bounds are read from env so you can tune them, that tuning is your M5 deliverable.
 
-The loop is deliberately transparent (hand-written tool-calling on the openai
-client) so a grader can see the machinery. Keep the bounds explicit if you rework it.
+The loop is deliberately transparent (hand-written tool-calling: Claude
+replies with a JSON tool request or a final answer) so a grader can see the machinery. Keep the bounds explicit if you rework it.
 """
 
 from __future__ import annotations
@@ -30,8 +30,7 @@ import os
 import sys
 from pathlib import Path
 
-from openai import OpenAI
-
+import llm
 import tools
 from critic import review
 from prompts import CORTEX_SYSTEM
@@ -44,14 +43,11 @@ except ImportError:
     pass
 
 # --- Bounds (your M5 deliverable: tune these and justify them) ----------------
-MODEL = os.environ.get("CORTEX_MODEL", "gpt-4o-mini")
+MODEL = os.environ.get("CORTEX_MODEL", "claude-haiku-5-5")
 MAX_ITERATIONS = int(os.environ.get("CORTEX_MAX_ITERATIONS", "8"))
 MAX_REVISIONS = int(os.environ.get("CORTEX_MAX_REVISIONS", "2"))
 COST_CAP_USD = float(os.environ.get("CORTEX_COST_CAP_USD", "0.50"))
 MAX_QUEUE_ITEMS = int(os.environ.get("CORTEX_MAX_QUEUE_ITEMS", "10"))
-# Rough $ per 1M tokens for your chosen model, set to match its pricing.
-PRICE_IN = float(os.environ.get("CORTEX_PRICE_IN_PER_M", "0.15"))
-PRICE_OUT = float(os.environ.get("CORTEX_PRICE_OUT_PER_M", "0.60"))
 
 TOOL_SCHEMAS = [
     {"type": "function", "function": {
@@ -87,15 +83,45 @@ TOOL_SCHEMAS = [
 ]
 
 
+TOOL_PROTOCOL = """
+
+How to use tools. You have these tools (JSON-schema parameters):
+""" + "\n".join(
+    f"- {t['function']['name']}: {t['function']['description']} "
+    f"params={json.dumps(t['function']['parameters']['properties'])}"
+    for t in TOOL_SCHEMAS) + """
+
+To call a tool, reply with ONLY one JSON object and nothing else, for example:
+{"tool": "get_project", "args": {"project_id": "P-1"}}
+You will get the result back and can call another tool. Call one tool per reply.
+When you are finished, reply with your DONE: or ESCALATE: answer as plain text, never JSON.
+"""
+
+
+def parse_tool_call(reply: str):
+    """Return (tool_name, args) if the reply is a tool request, else None."""
+    text = reply.strip()
+    if text.startswith("```"):
+        text = text.strip("`").removeprefix("json").strip()
+    if not text.startswith("{"):
+        return None
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(obj, dict) and "tool" in obj:
+        return obj["tool"], obj.get("args") or {}
+    return None
+
+
 class Bounds:
     """Tracks spend and trips the cost cap. This is enforced OUTSIDE the model."""
 
     def __init__(self):
         self.cost = 0.0
 
-    def add(self, usage) -> None:
-        self.cost += (usage.prompt_tokens * PRICE_IN
-                      + usage.completion_tokens * PRICE_OUT) / 1_000_000
+    def add(self, cost_usd: float) -> None:
+        self.cost += cost_usd  # real cost reported by the SDK for each call
 
     def over_cap(self) -> bool:
         return self.cost >= COST_CAP_USD
@@ -138,7 +164,6 @@ def emit_deliverable(which: str, draft: str, *, accepted: bool,
 
 
 def run(which: str = "happy") -> None:
-    client = OpenAI()
     bounds = Bounds()
     task = tools.get_task(which)
     if "error" in task:
@@ -148,10 +173,8 @@ def run(which: str = "happy") -> None:
     banner(f"CORTEX RUN, fixture: task-{which}  (auto-queue cap {MAX_QUEUE_ITEMS} items)")
     print(task["body"])
 
-    messages = [
-        {"role": "system", "content": CORTEX_SYSTEM},
-        {"role": "user", "content": f"PM task brief:\n\n{task['body']}"},
-    ]
+    system = CORTEX_SYSTEM + TOOL_PROTOCOL
+    transcript = [f"PM task brief:\n\n{task['body']}"]
     source_log: list[str] = [task["body"]]
     revisions = 0
     last_draft = ""
@@ -164,35 +187,36 @@ def run(which: str = "happy") -> None:
                              reason=reason, cost=bounds.cost)
             return
 
-        resp = client.chat.completions.create(
-            model=MODEL, messages=messages, tools=TOOL_SCHEMAS)
-        bounds.add(resp.usage)
-        msg = resp.choices[0].message
+        reply, cost = llm.complete(system, "\n\n".join(transcript), MODEL)
+        bounds.add(cost)
 
-        if msg.tool_calls:
-            messages.append(msg)
-            for call in msg.tool_calls:
-                fn = call.function.name
-                args = json.loads(call.function.arguments or "{}")
-                result = tools.TOOLS[fn](**args)
-                source_log.append(f"{fn}({args}) -> {json.dumps(result)}")
-                print(f"\n[step {step}] TOOL {fn}({args})")
-                print(f"          -> {json.dumps(result)[:300]}")
-                messages.append({"role": "tool", "tool_call_id": call.id,
-                                 "content": json.dumps(result)})
+        call = parse_tool_call(reply)
+        if call:
+            fn, args = call
+            if fn not in tools.TOOLS:
+                result = {"error": f"unknown tool {fn}"}
+            else:
+                try:
+                    result = tools.TOOLS[fn](**args)
+                except TypeError as e:
+                    result = {"error": f"bad arguments: {e}"}
+            source_log.append(f"{fn}({args}) -> {json.dumps(result)}")
+            print(f"\n[step {step}] TOOL {fn}({args})")
+            print(f"          -> {json.dumps(result)[:300]}")
+            transcript.append(f"ASSISTANT (tool request):\n{reply.strip()}")
+            transcript.append(f"TOOL RESULT {fn}:\n{json.dumps(result)}")
             continue
 
         # No tool calls => Cortex produced a proposed output. Validate it.
-        proposed = msg.content or ""
+        proposed = reply
         last_draft = proposed
         print(f"\n[step {step}] PROPOSED OUTPUT:\n{proposed}")
 
         banner("CRITIC, independent validation")
-        verdict = review(client, MODEL, proposed, "\n".join(source_log))
+        verdict = review(MODEL, proposed, "\n".join(source_log))
         # Estimate critic spend too.
-        bounds.cost += (verdict["_usage"]["prompt"] * PRICE_IN
-                        + verdict["_usage"]["completion"] * PRICE_OUT) / 1_000_000
-        print(json.dumps({k: v for k, v in verdict.items() if k != "_usage"}, indent=2))
+        bounds.add(verdict["_cost"])
+        print(json.dumps({k: v for k, v in verdict.items() if k != "_cost"}, indent=2))
 
         if verdict["verdict"] == "pass":
             banner(f"HITL CHECKPOINT, status update + any proposed stories queued for "
@@ -212,10 +236,9 @@ def run(which: str = "happy") -> None:
 
         revisions += 1
         print(f"\n-> critic rejected; revision {revisions}/{MAX_REVISIONS}")
-        messages.append(msg)
-        messages.append({"role": "user", "content":
-                         "A validator rejected that for these reasons: "
-                         f"{verdict['reasons']}. Fix it or escalate."})
+        transcript.append(f"ASSISTANT:\n{proposed}")
+        transcript.append("A validator rejected that for these reasons: "
+                          f"{verdict['reasons']}. Fix it or escalate.")
 
     banner(f"MAX ITERATIONS ({MAX_ITERATIONS}) reached without finishing. "
            f"Escalating. Run cost ≈ ${bounds.cost:.4f}")
