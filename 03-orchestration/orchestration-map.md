@@ -80,4 +80,14 @@ State is scoped per project, so one project's data never reaches another's criti
 
 ## 7. Cost & latency budget
 
-_Coordination has a price. Rough token/latency cost of the fleet vs a single agent. (Forward-link to M5 bounds.)_
+The critic is the price of the split. It adds **1 extra model call per item** (a Sonnet call, about $0.006), and at the revision cap it adds up to **3**.
+
+| Case | What happens | Cost |
+|---|---|---|
+| Clean pass | About 4 to 6 Haiku drafting calls, then 1 critic call | about $0.005 |
+| Worst case at the cap | 2 revisions: up to 3 critic calls and 2 extra drafting calls | about $0.02 |
+| Hard ceiling | The per-run cost cap in `.env` | $0.50 |
+
+That's roughly 2 to 3 times the cost of a single agent with no critic, but still cents per item.
+
+**Latency:** not yet measured. Each critic call adds a few seconds, and each revision adds one drafter call plus one critic call. Latency will be measured and bounded in M5.
