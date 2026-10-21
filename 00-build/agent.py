@@ -9,6 +9,7 @@ stop/escalate conditions, the auto-queue cap, and the absence of any publish too
 
 Usage (ask your coding agent to run these for you, or run them yourself):
     python agent.py                # runs the happy-path task (weekly status update)
+    python agent.py happy --request-id R1   # on-request run; a repeated ID is skipped
     python agent.py missing-data   # the stuck/escalate case
     python agent.py jailbreak       # the prompt-injection refusal case
 
@@ -28,6 +29,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections import Counter
+from datetime import date, datetime
 from pathlib import Path
 
 import llm
@@ -48,6 +51,13 @@ MAX_ITERATIONS = int(os.environ.get("CORTEX_MAX_ITERATIONS", "8"))
 MAX_REVISIONS = int(os.environ.get("CORTEX_MAX_REVISIONS", "2"))
 COST_CAP_USD = float(os.environ.get("CORTEX_COST_CAP_USD", "0.50"))
 MAX_QUEUE_ITEMS = int(os.environ.get("CORTEX_MAX_QUEUE_ITEMS", "10"))
+# Loop Spec (M2): the newest activity Cortex uses may be at most this many days old.
+FRESHNESS_DAYS = int(os.environ.get("CORTEX_FRESHNESS_DAYS", "10"))
+# "Today" for the freshness check. Blank = the real date. Set it only for demos, so
+# the dated fixtures count as fresh.
+AS_OF = date.fromisoformat(os.environ["CORTEX_AS_OF"]) if os.environ.get("CORTEX_AS_OF") else date.today()
+MAX_TOOL_ERRORS = 3   # stuck (a): a tool fails this many times
+MAX_REPEATS = 3       # stuck (b): the identical call is made this many times
 
 TOOL_SCHEMAS = [
     {"type": "function", "function": {
@@ -130,6 +140,39 @@ class Bounds:
 OUTPUT_DIR = Path(__file__).parent / "run-output"
 
 
+def newest_activity_date(result: dict):
+    """Newest date in a get_activity result, or None if there is none."""
+    dates = []
+    for item in result.get("activity", []):
+        try:
+            dates.append(date.fromisoformat(item["date"]))
+        except (KeyError, ValueError):
+            pass
+    return max(dates) if dates else None
+
+
+def notify_human(which: str, reason: str) -> None:
+    """Loop Spec: stuck and escalate both TELL a human. For now that is a visible
+    notice plus a line in run-output/notifications.log; a real channel needs a connector."""
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    line = f"{datetime.now():%Y-%m-%d %H:%M} task-{which}: {reason}"
+    with (OUTPUT_DIR / "notifications.log").open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
+    banner(f"NOTIFY HUMAN, {reason}")
+
+
+def already_ran(request_id: str) -> bool:
+    """Dedupe by request ID: record the ID, and say whether we have run it before."""
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    path = OUTPUT_DIR / "request-ids.json"
+    seen = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    if request_id in seen:
+        return True
+    seen[request_id] = datetime.now().isoformat(timespec="seconds")
+    path.write_text(json.dumps(seen, indent=2), encoding="utf-8")
+    return False
+
+
 def banner(text: str) -> None:
     print(f"\n{'=' * 64}\n{text}\n{'=' * 64}")
 
@@ -151,6 +194,7 @@ def emit_deliverable(which: str, draft: str, *, accepted: bool,
         print("(Cortex stopped before it produced a draft, nothing to show.)")
     if not accepted:
         print(f"\nWhy it was held: {reason}")
+        notify_human(which, reason)
 
     if draft.strip():
         OUTPUT_DIR.mkdir(exist_ok=True)
@@ -163,7 +207,10 @@ def emit_deliverable(which: str, draft: str, *, accepted: bool,
               f"(for your review, nothing was posted)")
 
 
-def run(which: str = "happy") -> None:
+def run(which: str = "happy", request_id: str | None = None) -> None:
+    if request_id and already_ran(request_id):
+        print(f"Request {request_id} was already run, skipping (dedupe by request ID).")
+        return
     bounds = Bounds()
     task = tools.get_task(which)
     if "error" in task:
@@ -174,8 +221,12 @@ def run(which: str = "happy") -> None:
     print(task["body"])
 
     system = CORTEX_SYSTEM + TOOL_PROTOCOL
-    transcript = [f"PM task brief:\n\n{task['body']}"]
+    transcript = [f"Today's date for this run: {AS_OF.isoformat()}\n\n"
+                  f"PM task brief:\n\n{task['body']}"]
     source_log: list[str] = [task["body"]]
+    fresh_checked = False
+    errors: Counter = Counter()
+    calls: Counter = Counter()
     revisions = 0
     last_draft = ""
 
@@ -193,8 +244,11 @@ def run(which: str = "happy") -> None:
         call = parse_tool_call(reply)
         if call:
             fn, args = call
+            calls[(fn, json.dumps(args, sort_keys=True))] += 1
             if fn not in tools.TOOLS:
                 result = {"error": f"unknown tool {fn}"}
+            elif fn == "propose_stories" and not fresh_checked:
+                result = {"error": "blocked: pull get_activity and pass the freshness check before proposing stories"}
             else:
                 try:
                     result = tools.TOOLS[fn](**args)
@@ -205,6 +259,32 @@ def run(which: str = "happy") -> None:
             print(f"          -> {json.dumps(result)[:300]}")
             transcript.append(f"ASSISTANT (tool request):\n{reply.strip()}")
             transcript.append(f"TOOL RESULT {fn}:\n{json.dumps(result)}")
+
+            if "error" in result:
+                errors[fn] += 1
+            if errors[fn] >= MAX_TOOL_ERRORS:
+                reason = f"stuck: {fn} failed {errors[fn]}x"
+                banner(f"STUCK, {reason}. Stopping.")
+                emit_deliverable(which, last_draft, accepted=False, reason=reason, cost=bounds.cost)
+                return
+            if max(calls.values()) >= MAX_REPEATS:
+                reason = "stuck: the same tool call repeated with no new information"
+                banner(f"STUCK, {reason}. Stopping.")
+                emit_deliverable(which, last_draft, accepted=False, reason=reason, cost=bounds.cost)
+                return
+
+            if fn == "get_activity" and "error" not in result:
+                newest = newest_activity_date(result)
+                age = (AS_OF - newest).days if newest else None
+                if age is None or age > FRESHNESS_DAYS:
+                    shown = f"{age} days old" if age is not None else "undated"
+                    reason = (f"escalate: newest activity is {shown} "
+                              f"(limit {FRESHNESS_DAYS} days, as of {AS_OF})")
+                    banner(f"FRESHNESS CHECK FAILED, {reason}. Escalating before anything is queued.")
+                    emit_deliverable(which, last_draft, accepted=False, reason=reason, cost=bounds.cost)
+                    return
+                fresh_checked = True
+                print(f"          freshness OK: newest activity {age} days old (limit {FRESHNESS_DAYS})")
             continue
 
         # No tool calls => Cortex produced a proposed output. Validate it.
@@ -218,7 +298,15 @@ def run(which: str = "happy") -> None:
         bounds.add(verdict["_cost"])
         print(json.dumps({k: v for k, v in verdict.items() if k != "_cost"}, indent=2))
 
+        if (verdict["verdict"] == "pass" and "ESCALATE:" not in proposed
+                and "sources" not in proposed.lower()):
+            verdict = {"verdict": "fail", "reasons": [
+                "Loop Spec: a done draft must list the sources it relied on."]}
+            print("-> no sources list in the draft; treated as not done")
+
         if verdict["verdict"] == "pass":
+            if "ESCALATE:" in proposed:
+                notify_human(which, "Cortex escalated: " + proposed.split("ESCALATE:", 1)[1].strip()[:200])
             banner(f"HITL CHECKPOINT, status update + any proposed stories queued for "
                    f"your review. Nothing posted, no commitments made. "
                    f"Run cost ≈ ${bounds.cost:.4f}")
@@ -248,4 +336,10 @@ def run(which: str = "happy") -> None:
 
 
 if __name__ == "__main__":
-    run(sys.argv[1] if len(sys.argv) > 1 else "happy")
+    args = sys.argv[1:]
+    rid = None
+    if "--request-id" in args:
+        i = args.index("--request-id")
+        rid = args[i + 1]
+        del args[i:i + 2]
+    run(args[0] if args else "happy", rid)
