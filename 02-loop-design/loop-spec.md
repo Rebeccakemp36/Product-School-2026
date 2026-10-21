@@ -49,4 +49,4 @@ _`state` is always-on. `connectors` only if you already have one wired (e.g. a J
 
 ## Link to live loop
 
-_[path to your agent in `00-build/`]_
+[`00-build/agent.py`](../00-build/agent.py), run with `python agent.py` (happy path), `python agent.py missing-data`, or `python agent.py happy --request-id <id>` for an on-request run.
