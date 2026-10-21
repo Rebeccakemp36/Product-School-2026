@@ -11,10 +11,12 @@ import llm
 from prompts import CRITIC_SYSTEM
 
 
-def review(model: str, proposed_output: str, source_data: str) -> dict:
+def review(model: str, proposed_output: str, source_data: str,
+           run_date: str = "", freshness_days: int = 10) -> dict:
     """Return {"verdict": "pass"|"fail", "reasons": [...]} for a proposed output."""
     text, cost = llm.complete(
         CRITIC_SYSTEM + "\nRespond with the JSON object only, no other text.",
+        f"RUN DATE (authoritative): {run_date}. Freshness limit: {freshness_days} days.\n\n"
         f"SOURCE DATA Cortex used:\n{source_data}\n\n"
         f"CORTEX PROPOSED OUTPUT:\n{proposed_output}",
         model)

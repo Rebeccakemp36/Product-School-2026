@@ -47,6 +47,8 @@ except ImportError:
 
 # --- Bounds (your M5 deliverable: tune these and justify them) ----------------
 MODEL = os.environ.get("CORTEX_MODEL", "claude-haiku-5-5")
+# The critic runs on a stronger model than the drafter (Orchestration Map, Field 3).
+CRITIC_MODEL = os.environ.get("CORTEX_CRITIC_MODEL", "claude-sonnet-5-5")
 MAX_ITERATIONS = int(os.environ.get("CORTEX_MAX_ITERATIONS", "8"))
 MAX_REVISIONS = int(os.environ.get("CORTEX_MAX_REVISIONS", "2"))
 COST_CAP_USD = float(os.environ.get("CORTEX_COST_CAP_USD", "0.50"))
@@ -292,8 +294,9 @@ def run(which: str = "happy", request_id: str | None = None) -> None:
         last_draft = proposed
         print(f"\n[step {step}] PROPOSED OUTPUT:\n{proposed}")
 
-        banner("CRITIC, independent validation")
-        verdict = review(MODEL, proposed, "\n".join(source_log))
+        banner(f"CRITIC, independent validation (model: {CRITIC_MODEL})")
+        verdict = review(CRITIC_MODEL, proposed, "\n".join(source_log),
+                         AS_OF.isoformat(), FRESHNESS_DAYS)
         # Estimate critic spend too.
         bounds.add(verdict["_cost"])
         print(json.dumps({k: v for k, v in verdict.items() if k != "_cost"}, indent=2))
